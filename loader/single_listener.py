@@ -48,13 +48,14 @@ def get_message_body(sqs_message):
 
 
 class EntityListener(Process):
-    def __init__(self, config, delete_queue, **kwargs):
+    def __init__(self, config, delete_queue, delete_messages, **kwargs):
         super(EntityListener, self).__init__()
 
         self.session_usergrid = requests.Session()
         self.session_elastic = requests.Session()
         self.sqs_config = config.get('sqs')
         self.delete_queue = delete_queue
+        self.delete_messages = delete_messages
         self.base_url = config.get('ug_base_url')
         self.usergrid_headers = {"Content-Type": "application/json"}
         self.credential_map = config.get('credential_map')
@@ -356,7 +357,8 @@ class EntityListener(Process):
 
                     if not 'org' in message or not 'app' in message or not 'collection' in message or not 'entity' in message:
                         self.post_malformed_message_error(sqs_message)
-                        self.delete_queue.put(sqs_message)
+                        if self.delete_messages:
+                            self.delete_queue.put(sqs_message)
                         continue
 
                     org = message.get('org')
@@ -387,7 +389,8 @@ class EntityListener(Process):
 
                     total_response_time += response_time
 
-                    self.delete_queue.put(sqs_message)
+                    if self.delete_messages:
+                        self.delete_queue.put(sqs_message)
 
                 except Exception, e:
                     print traceback.format_exc()
@@ -533,6 +536,11 @@ def parse_args():
                         type=int,
                         default=32)
 
+    parser.add_argument('--delete_workers',
+                        help='The number delete workers to run',
+                        type=int,
+                        default=4)
+
     my_args = parser.parse_args(sys.argv[1:])
 
     print str(my_args)
@@ -569,24 +577,36 @@ class MessageDeleter(Process):
 
 class ListenerController():
     def __init__(self, config):
-        self.delete_queue = JoinableQueue()
         self.config = config
         self.sqs_config = config.get('sqs')
         self.queue_name = config.get('queue_name')
         self.thread_count = config.get('threads')
+        self.delete_workers = config.get('delete_workers')
+        self.delete_queue = JoinableQueue()
+        self.delete_messages = True
+
+        if self.delete_workers < 1:
+            self.delete_messages = False
 
     def run(self):
-        delete_threads = [MessageDeleter(queue_name=self.queue_name,
-                                         sqs_config=self.sqs_config,
-                                         delete_queue=self.delete_queue) for x in xrange(4)]
 
-        print 'Starting %s threads...' % self.thread_count
+        print 'Starting %s listener threads...' % self.thread_count
 
         workers = [EntityListener(config=self.config,
-                                  delete_queue=self.delete_queue) for x in xrange(self.thread_count)]
+                                  delete_queue=self.delete_queue,
+                                  delete_messages=self.delete_messages) for x in xrange(self.thread_count)]
 
         [worker.start() for worker in workers]
-        [deleter.start() for deleter in delete_threads]
+
+        # Give us the option to leave messages in the queue if we want to quickly re-tests (e.g load testing BaaS)
+        if self.delete_workers > 0:
+            print 'Starting %s deleter threads...' % self.delete_workers
+
+            delete_threads = [MessageDeleter(queue_name=self.queue_name,
+                                             sqs_config=self.sqs_config,
+                                             delete_queue=self.delete_queue) for x in xrange(self.delete_workers)]
+
+            [deleter.start() for deleter in delete_threads]
 
         keep_going = True
 
@@ -609,7 +629,9 @@ class ListenerController():
 
         print 'terminating...'
         [worker.terminate() for worker in workers]
-        [deleter.terminate() for deleter in delete_threads]
+
+        if delete_threads is not None:
+            [deleter.terminate() for deleter in delete_threads]
 
 
 if __name__ == '__main__':
