@@ -100,9 +100,10 @@ def parse_args():
                         type=int,
                         default=32)
 
-    parser.add_argument('-k', '--keystring',
-                        help='The specific key to process',
-                        type=str)
+    parser.add_argument('-i', '--include',
+                        help='The specific key/file to process',
+                        type=str,
+                        action='append')
 
     parser.add_argument('-q', '--queue_name',
                         help='The queue name to send messages to.  If not specified the filename is used',
@@ -352,15 +353,15 @@ def get_date_keys():
 
 
 class S3Publisher():
-    def __init__(self, **kwargs):
-        self.args = kwargs.get('args')
+    def __init__(self):
+        self.args = parse_args()
 
         with open(self.args.get('config'), 'r') as f:
             self.config = json.load(f)
 
-        self.sqs_config = self.config.get('sqs_config')
+        self.sqs_config = self.config.get('sqs')
         self.queue_name = self.args.get('queue_name')
-        self.s3_config = self.config.get('s3_config')
+        self.s3_config = self.config.get('sqs')
         self.bucket_name = self.args.get('bucket')
         self.credential_map = self.config.get('credential_map')
         self.logger = logging.getLogger('S3Publisher')
@@ -523,6 +524,10 @@ class S3Publisher():
         new_keys = []
         publish_queue = JoinableQueue()
 
+        include_keys = self.args.get('include')
+        if include_keys is not None:
+            self.logger.info('Include option provided, will process only include_keys=%s', str(include_keys))
+
         try:
             for key in key_list:
                 keyString = key.key
@@ -535,12 +540,15 @@ class S3Publisher():
                 if 'wow/' in keyString:
                     continue
 
-                if self.args.get('keystring') is not None:
-                    if self.args.get('keystring') in keyString:
-                        process = True
-                else:
-                    for string in strings:
-                        if string in keyString:
+                for string in strings:
+                    if string in keyString:
+                        if include_keys is not None:
+                            if keyString in include_keys:
+                                self.logger.info('[%s] is contained in include_keys %s, processing...', keyString,
+                                                 str(include_keys))
+                            process = True
+                            break
+                        else:
                             self.logger.info('Found [%s] in Key [%s]: Evaluating...' % (string, keyString))
                             process = True
                             break
@@ -631,9 +639,7 @@ class S3Publisher():
             [p.terminate() for p in publishers]
 
 
-def main():
-    init_logging(stdout_enabled=True)
-
-
 if __name__ == '__main__':
-    main()
+    init_logging(stdout_enabled=True)
+    S3Publisher = S3Publisher()
+    S3Publisher.run()

@@ -48,13 +48,17 @@ def get_message_body(sqs_message):
 
 
 class EntityListener(Process):
-    def __init__(self, config, delete_queue, **kwargs):
+    def __init__(self, config, delete_queue, delete_messages, collection_override, audit_entities, **kwargs):
         super(EntityListener, self).__init__()
 
         self.session_usergrid = requests.Session()
         self.session_elastic = requests.Session()
         self.sqs_config = config.get('sqs')
         self.delete_queue = delete_queue
+        self.delete_messages = delete_messages
+        self.collection_override = collection_override
+        self.audit_entities = audit_entities
+        self.do_audit = config.get('do_audit')
         self.base_url = config.get('ug_base_url')
         self.usergrid_headers = {"Content-Type": "application/json"}
         self.credential_map = config.get('credential_map')
@@ -87,11 +91,16 @@ class EntityListener(Process):
         self.parse_error_queue_name = self.queue_name + '-parse-errors'
         self.malformed_message_queue_name = self.queue_name + '-malformed'
         self.malformed_message_queue_name = self.queue_name + '-reprocess'
+        self.audit_queue_name = self.queue_name + '-audit'
 
         self.error_queue = None
         self.exception_queue = None
         self.parse_error_queue = None
         self.malformed_message_queue = None
+        self.audit_queue = None
+
+        if self.do_audit:
+            self.audit_queue = self.sqs_conn.get_queue(self.audit_queue_name)
 
     def check_exists(self, collection_name, entity_name):
         if True:
@@ -169,7 +178,10 @@ class EntityListener(Process):
                 try:
                     response = r.json()
 
-                    if len(response.get('entities')) != 1:
+                    if self.audit_entities:
+                        self.add_to_audit(oac_tuple, the_entity)
+
+                    elif len(response.get('entities')) != 1:
                         message = 'Entity not returned after %s' % method
                         report_error = True
 
@@ -192,6 +204,50 @@ class EntityListener(Process):
 
         except Exception, e:
             self.post_exception(oac_tuple, the_entity, 'Error on %s: %s' % (method, traceback.format_exc()))
+            print traceback.format_exc()
+            raise e
+
+    def audit_entity(self, oac_tuple, the_entity):
+        # print 'Loading entity to Usergrid...'
+
+        try:
+            url = self.get_entity_url(oac_tuple, the_entity)
+
+            r = self.session_usergrid.get(url=url,
+                                          headers=self.usergrid_headers)
+
+            response_time = total_milliseconds(r.elapsed)
+
+            if r.status_code != 200:
+                print '%s (%s) in %s: %s' % ('GET', r.status_code, response_time, url)
+
+            if r.status_code != 200:
+                try:
+                    message = r.json()
+
+                except ValueError, e:
+                    message = r.text
+
+            else:
+                try:
+                    response = r.json()
+
+                    if len(response.get('entities')) != 1:
+                        message = 'Entity not returned after %s' % 'GET'
+
+                except ValueError, e:
+                    message = 'Exception (%s) getting JSON from response!' % e
+                    print message
+                    print 'response: %s' % r.text
+
+                except Exception, e:
+                    message = 'Exception (%s) getting JSON from response!' % e
+                    print message
+                    print 'response: %s' % r.text
+
+            return response_time
+
+        except Exception, e:
             print traceback.format_exc()
             raise e
 
@@ -312,6 +368,11 @@ class EntityListener(Process):
         keep_going = True
         zero_counter = 0
 
+        fetch_queue = self.message_queue
+        if self.do_audit:
+            print ('Audit specified, fetching messages from queue_name=[%s]', self.audit_queue_name)
+            fetch_queue = self.audit_queue
+
         while keep_going:
 
             self.check_queues_and_wait()
@@ -319,8 +380,8 @@ class EntityListener(Process):
             sqs_start_time = datetime.datetime.utcnow()
 
             # print 'querying SQS...'
-            sqs_messages = self.message_queue.get_messages(num_messages=10,
-                                                           wait_time_seconds=10)
+            sqs_messages = fetch_queue.get_messages(num_messages=10,
+                                                    wait_time_seconds=10)
             sqs_stop_time = datetime.datetime.utcnow()
             sqs_iterations += 1
             sqs_response_time = total_milliseconds(sqs_stop_time - sqs_start_time)
@@ -356,16 +417,24 @@ class EntityListener(Process):
 
                     if not 'org' in message or not 'app' in message or not 'collection' in message or not 'entity' in message:
                         self.post_malformed_message_error(sqs_message)
-                        self.delete_queue.put(sqs_message)
+                        if self.delete_messages:
+                            self.delete_queue.put(sqs_message)
                         continue
 
                     org = message.get('org')
                     app = message.get('app')
                     collection = message.get('collection')
+                    if self.collection_override:
+                        collection = self.collection_override
                     entity = message.get('entity')
 
-                    if 'name' in entity:
-                        if not self.check_exists(collection, entity.get('name')):
+                    if self.do_audit:
+                        response_time = self.audit_entity(
+                            oac_tuple={'org': org, 'app': app, 'collection': collection},
+                            the_entity=entity)
+
+                    elif 'name' in entity:
+                        if True:  # not self.check_exists(collection, entity.get('name')):
 
                             # print json.dumps(entity, indent=2)
 
@@ -387,7 +456,8 @@ class EntityListener(Process):
 
                     total_response_time += response_time
 
-                    self.delete_queue.put(sqs_message)
+                    if self.delete_messages or not self.do_audit:
+                        self.delete_queue.put(sqs_message)
 
                 except Exception, e:
                     print traceback.format_exc()
@@ -421,6 +491,22 @@ class EntityListener(Process):
             self.error_queue = attach_queue(self.sqs_conn, self.error_queue_name)
 
         self.error_queue.write(m)
+
+    def add_to_audit(self, oac_tuple, the_entity):
+        message = {
+            'org': oac_tuple.get('org'),
+            'app': oac_tuple.get('app'),
+            'collection': oac_tuple.get('collection'),
+            'entity': the_entity
+        }
+
+        m = RawMessage()
+        m.set_body(json.dumps(message, 2))
+
+        if self.audit_queue is None:
+            self.audit_queue = attach_queue(self.sqs_conn, self.audit_queue_name)
+
+        self.audit_queue.write(m)
 
     def post_exception(self, oac_tuple, the_entity, traceback_exception):
         message = {
@@ -467,10 +553,14 @@ class EntityListener(Process):
     def get_collection_url(self, oac_tuple):
         auth_params = self.get_org_credentials(org=oac_tuple.get('org'))
 
+        collection = oac_tuple.get('collection')
+        if self.collection_override is not None:
+            collection = self.collection_override
+
         params = {
             'org': oac_tuple.get('org'),
             'app': oac_tuple.get('app'),
-            'collection': oac_tuple.get('collection'),
+            'collection': collection,
             'client_id': auth_params.get('client_id'),
             'client_secret': auth_params.get('client_secret')
         }
@@ -481,10 +571,14 @@ class EntityListener(Process):
     def get_entity_url(self, oac_tuple, the_entity):
         auth_params = self.get_org_credentials(org=oac_tuple.get('org'))
 
+        collection = oac_tuple.get('collection')
+        if self.collection_override is not None:
+            collection = self.collection_override
+
         params = {
             'org': oac_tuple.get('org'),
             'app': oac_tuple.get('app'),
-            'collection': oac_tuple.get('collection'),
+            'collection': collection,
             'name': the_entity.get('name'),
             'client_id': auth_params.get('client_id'),
             'client_secret': auth_params.get('client_secret')
@@ -533,6 +627,25 @@ def parse_args():
                         type=int,
                         default=32)
 
+    parser.add_argument('--delete_workers',
+                        help='The number delete workers to run',
+                        type=int,
+                        default=4)
+
+    parser.add_argument('--collection',
+                        help='Collection override in which to load data',
+                        type=str)
+
+    parser.add_argument('-a', '--audit',
+                        help='Set a flag on whether or not provide audit capabilities for inserted entities',
+                        action='store_true',
+                        default=False)
+
+    parser.add_argument('--do_audit',
+                        help='Set a flag on whether or not perform the entity audit',
+                        action='store_true',
+                        default=False)
+
     my_args = parser.parse_args(sys.argv[1:])
 
     print str(my_args)
@@ -569,24 +682,41 @@ class MessageDeleter(Process):
 
 class ListenerController():
     def __init__(self, config):
-        self.delete_queue = JoinableQueue()
         self.config = config
         self.sqs_config = config.get('sqs')
         self.queue_name = config.get('queue_name')
         self.thread_count = config.get('threads')
+        self.delete_workers = config.get('delete_workers')
+        self.delete_queue = JoinableQueue()
+        self.delete_messages = True
+        self.collection_override = config.get('collection')
+        self.audit_entities = config.get('audit')
+        self.do_audit = config.get('do_audit')
+
+        if self.delete_workers < 1:
+            self.delete_messages = False
 
     def run(self):
-        delete_threads = [MessageDeleter(queue_name=self.queue_name,
-                                         sqs_config=self.sqs_config,
-                                         delete_queue=self.delete_queue) for x in xrange(4)]
 
-        print 'Starting %s threads...' % self.thread_count
+        print 'Starting %s listener threads...' % self.thread_count
 
         workers = [EntityListener(config=self.config,
-                                  delete_queue=self.delete_queue) for x in xrange(self.thread_count)]
+                                  delete_queue=self.delete_queue,
+                                  delete_messages=self.delete_messages,
+                                  collection_override=self.collection_override,
+                                  audit_entities=self.audit_entities) for x in xrange(self.thread_count)]
 
         [worker.start() for worker in workers]
-        [deleter.start() for deleter in delete_threads]
+
+        # Give us the option to leave messages in the queue if we want to quickly re-tests (e.g load testing BaaS)
+        if self.delete_workers > 0 and not self.do_audit:
+            print 'Starting %s deleter threads...' % self.delete_workers
+
+            delete_threads = [MessageDeleter(queue_name=self.queue_name,
+                                             sqs_config=self.sqs_config,
+                                             delete_queue=self.delete_queue) for x in xrange(self.delete_workers)]
+
+            [deleter.start() for deleter in delete_threads]
 
         keep_going = True
 
@@ -609,7 +739,9 @@ class ListenerController():
 
         print 'terminating...'
         [worker.terminate() for worker in workers]
-        [deleter.terminate() for deleter in delete_threads]
+
+        if delete_threads is not None:
+            [deleter.terminate() for deleter in delete_threads]
 
 
 if __name__ == '__main__':
